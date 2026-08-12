@@ -1,0 +1,7 @@
+# Image Toolkit runtime deps — all permissive / weak-copyleft, no AGPL/proprietary.
+Pillow>=10.4
+numpy>=1.26,<3
+opencv-python>=4.8         # Apache-2.0 (cv2); MIT packaging
+scikit-image>=0.22         # BSD
+rawpy>=0.19                # LibRaw (LGPL/CDDL) — RAW loading; import is guarded
+piexif>=1.1                # MIT — EXIF read/write/strip
