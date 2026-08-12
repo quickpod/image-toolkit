@@ -6,6 +6,9 @@
   "license": "Apache-2.0",
   "description": "Image Toolkit is a local, offline image editor and batch processor. It covers the everyday and the advanced: crop/rotate/flip/resize/canvas/perspective, full color and tone controls (curves, levels, white balance, HSL, exposure, highlights/shadows), retouching (classical heal/inpaint spot & object removal, red-eye, skin smoothing, denoise, sharpen), non-destructive layers with blend modes and masks, filters and effects (blur, vignette, film looks, .cube LUTs, pencil/stylize), annotation, panorama stitching, HDR merge, focus stacking, content-aware (seam-carve) scaling, RAW loading, and full batch pipelines. Exports JPEG/PNG/WebP/TIFF with presets and metadata control. Built on permissive open-source libraries (Pillow, NumPy, OpenCV, scikit-image, rawpy); nothing is uploaded anywhere.",
   "aiStack": "Python (tkinter GUI + CLI), Pillow, NumPy, OpenCV, scikit-image, rawpy",
-  "platforms": ["windows"],
+  "platforms": [
+    "windows",
+    "linux"
+  ],
   "buildEntry": "image_toolkit_app.py"
 }
