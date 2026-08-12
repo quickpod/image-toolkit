@@ -15,9 +15,11 @@ results are marshalled back with ``self.after`` and reported inline (the
 ``history.History`` of full numpy snapshots.
 
 Design goals baked in here:
-  * pure standard-library tkinter/ttk plus Pillow's ``ImageTk`` (Pillow is
-    already a core dependency; it is the correct way to show images in Tk).  NO
-    other third-party GUI deps -- dark mode is a ttk-style + palette swap.
+  * built on the vendored ``imgtoolkit/aura.py`` design system (the QuickOpen
+    "Aura" look layered over CustomTkinter): a sidebar tool rail, the signature
+    accent beam under the header, and an inline status bar.  The working image
+    lives on a persistent Pillow ``ImageTk`` canvas while each tool swaps only
+    its control panel.  Runtime deps: ``customtkinter`` (+ ``darkdetect``).
   * Importing this module does nothing.  Only :func:`main` builds a root window,
     and it degrades gracefully (prints a message, returns 0) with no display.
   * Frozen-exe safe: bundled assets are resolved via ``sys._MEIPASS`` / the exe
@@ -62,23 +64,8 @@ ANCHORS = [
 ]
 RESAMPLE = ["auto", "nearest", "bilinear", "bicubic", "area", "lanczos"]
 
-# ---- colour palettes (mirror the QuickOpen palette) -------------------------
-PALETTES = {
-    "light": {
-        "bg": "#f5f7fa", "surface": "#ffffff", "text": "#141820",
-        "muted": "#5b6472", "primary": "#2f5fe0", "primary_hi": "#2450c8",
-        "entry": "#ffffff", "border": "#d5dae2", "sel": "#2f5fe0",
-        "sel_fg": "#ffffff", "trough": "#e2e7ef", "ok": "#1f7a3d",
-        "err": "#c0392b", "canvas": "#e9edf3", "overlay": "#2f5fe0",
-    },
-    "dark": {
-        "bg": "#0f1115", "surface": "#1a1e24", "text": "#f1f3f7",
-        "muted": "#9aa4b2", "primary": "#5b86f7", "primary_hi": "#7098ff",
-        "entry": "#1a1e24", "border": "#2a2f38", "sel": "#5b86f7",
-        "sel_fg": "#0f1115", "trough": "#2a2f38", "ok": "#5bd68a",
-        "err": "#ff6b5e", "canvas": "#0a0c10", "overlay": "#7098ff",
-    },
-}
+# Per-app Aura accent — Image Toolkit's icon teal (publish icon set).
+ACCENT = "#0e8c7f"
 
 # (category, [(tool_id, label), ...]) -- tool_id maps to a _panel_<id> method.
 TOOL_TREE = [
@@ -161,6 +148,20 @@ TOOL_DESCRIPTIONS = {
     "export": "Export with a named preset or custom format & quality.",
 }
 
+# Aura sidebar nav glyphs — chosen from the DejaVu-safe set (Linux fallback
+# font): ⌂ ⚙ ⇄ ⚲ ▤ ◉ ✎ ◈ ⊙ ℹ ✳ .  One glyph per tool category.
+_CAT_GLYPH = {
+    "Transform": "⇄", "Color & Tone": "◉", "Filters & Effects": "✳",
+    "Retouch": "✎", "Annotate": "◈", "Layers": "▤", "Batch": "⊙",
+    "File": "⚙",
+}
+GLYPHS = {tid: _CAT_GLYPH.get(cat, "◈")
+          for cat, tools in TOOL_TREE for tid, _label in tools}
+
+# Flat (id, label) list — a stable, crawler-discoverable section index.
+SECTIONS = [(tid, label) for _cat, tools in TOOL_TREE for tid, label in tools]
+FIRST_TOOL = SECTIONS[0][0]
+
 
 # ---------------------------------------------------------------------------
 # Asset / frozen handling
@@ -236,16 +237,17 @@ def build_app():
     """
     import tkinter as tk
     from tkinter import ttk, filedialog, colorchooser
+    import customtkinter as ctk
     import numpy as np
     from PIL import Image, ImageTk
 
-    from . import guiconfig
+    from . import aura, guiconfig
     from . import (io_util, transform, color, filters, retouch, annotate,
                    watermark, export, batch, layers)
     from .errors import ImgToolkitError
     from .history import History
 
-    FONT = "Segoe UI"
+    FONT = aura._family()   # Aura UI family (DejaVu Sans on Linux, Segoe on NT)
     MAX_PREVIEW = 900   # longest edge of the fast live-preview proxy
 
     def np_to_pil(img):
@@ -346,6 +348,7 @@ def build_app():
                                     highlightthickness=1, bd=0)
             self.canvas.pack()
             app.track(self.canvas, "curve")
+            app._curves.append(self)
             self._drag = None
             self.canvas.bind("<Button-1>", self._press)
             self.canvas.bind("<B1-Motion>", self._move)
@@ -798,14 +801,19 @@ def build_app():
     # ==================================================================
     # The main window
     # ==================================================================
-    class App(tk.Tk):
-        def __init__(self):
-            super().__init__()
-            self.title(WINDOW_TITLE)
-            self.geometry("1240x780")
-            self.minsize(1000, 640)
+    class App(aura.AuraApp):
+        """Aura-scaffolded image editor: sidebar tool rail + persistent canvas
+        + swappable per-tool control panel + inline status bar."""
 
-            self.theme = guiconfig.get_theme()
+        def __init__(self):
+            super().__init__(
+                title=WINDOW_TITLE, app_name=APP_NAME, accent=ACCENT,
+                theme=guiconfig.get_theme(),
+                icon_png=asset_path("image-toolkit.png"),
+                version=APP_VERSION, tagline="offline editor",
+                on_theme_change=guiconfig.set_theme,
+                size=(1280, 820), min_size=(1060, 680))
+
             self.image = None            # working ndarray (source of truth)
             self.image_path = None
             self.history = History(max_depth=20)
@@ -813,20 +821,20 @@ def build_app():
             self._proxy_for = None       # id() of image the proxy was built from
             self._preview_job = None
             self._busy = False
-            self._tracked = []
-            self._panels = {}
-            self._current = None
-            self._nav_ids = {}
-            self._img_refs = []
+            self._app_tracked = []       # (widget, role) raw-tk recolor registry
+            self._curves = []            # CurveEditor instances (theme-flip redraw)
+            self._panels = {}            # sid -> holder frame (crawler-friendly)
+            self._current = None         # active holder frame (crawler-friendly)
             self.doc = None              # layers Document (built on demand)
 
-            self._set_icon()
+            self._extra_styles()
+            self._build_content_area()
             self._build_menu()
-            self._build_layout()
-            self._apply_theme()
+            self._build_nav()
             self._bind_keys()
+            self._set_icon()
             self.protocol("WM_DELETE_WINDOW", self.destroy)
-            self.after(60, self._select_first_tool)
+            self.after(60, lambda: self.show(FIRST_TOOL))
 
         # ---- assets / icon --------------------------------------------
         def _set_icon(self):
@@ -846,108 +854,194 @@ def build_app():
             except Exception:
                 pass  # icon is cosmetic; never block launch
 
-        # ---- theming ---------------------------------------------------
+        # ---- theming bridge (Aura owns the palette; adapt custom tk widgets)
         def track(self, widget, role):
-            self._tracked.append((widget, role))
+            """Register a raw tk widget for re-theming when the theme flips.
+
+            "listbox" is delegated to the Aura registry; the app-specific
+            "imgcanvas"/"curve" roles are recoloured by :meth:`_recolor_custom`.
+            """
+            if role == "listbox":
+                aura.track(widget, "listbox")
+                return
+            self._app_tracked.append((widget, role))
+            self._recolor_custom()
 
         def _pal(self):
-            return PALETTES[self.theme]
+            """A house-style palette dict, resolved from the live Aura tokens,
+            so the legacy ImageCanvas/CurveEditor drawing code works unchanged."""
+            p = aura.P()
+            return {
+                "surface": p["surface"], "border": p["border"],
+                "primary": p["accent"], "overlay": p["accent"],
+                "text": p["text"], "muted": p["muted"],
+                "canvas": p["bg"], "bg": p["bg"],
+                "ok": p["ok"], "err": p["danger"], "entry": p["field"],
+                "sel": p["accent"], "sel_fg": p["on_accent"],
+                "trough": p["surface3"],
+            }
 
-        def _apply_theme(self):
+        def _recolor_custom(self):
             p = self._pal()
-            style = ttk.Style(self)
-            try:
-                style.theme_use("clam")
-            except Exception:
-                pass
-            self.configure(bg=p["bg"])
-            style.configure(".", background=p["bg"], foreground=p["text"],
-                            fieldbackground=p["entry"], bordercolor=p["border"],
-                            font=(FONT, 10))
-            style.configure("TFrame", background=p["bg"])
-            style.configure("Sidebar.TFrame", background=p["surface"])
-            style.configure("Card.TFrame", background=p["surface"])
-            style.configure("TLabel", background=p["bg"], foreground=p["text"])
-            style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Header.TLabel", background=p["bg"], foreground=p["text"],
-                            font=(FONT, 15, "bold"))
-            style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Brand.TLabel", background=p["surface"],
-                            foreground=p["text"], font=(FONT, 12, "bold"))
-            style.configure("Status.TLabel", background=p["surface"],
-                            foreground=p["muted"])
-            style.configure("TButton", background=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], focuscolor=p["surface"],
-                            padding=(9, 4))
-            style.map("TButton",
-                      background=[("active", p["trough"]), ("disabled", p["bg"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Accent.TButton", background=p["primary"],
-                            foreground="#ffffff", padding=(11, 5))
-            style.map("Accent.TButton",
-                      background=[("active", p["primary_hi"]),
-                                  ("disabled", p["border"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Toggle.TButton", background=p["surface"],
-                            foreground=p["text"], padding=(8, 4))
-            for name in ("TEntry", "TSpinbox"):
-                style.configure(name, fieldbackground=p["entry"], foreground=p["text"],
-                                insertcolor=p["text"], bordercolor=p["border"])
-            style.configure("TCombobox", fieldbackground=p["entry"],
-                            foreground=p["text"], background=p["surface"],
-                            arrowcolor=p["text"])
-            style.map("TCombobox", fieldbackground=[("readonly", p["entry"])],
-                      foreground=[("readonly", p["text"])])
-            style.configure("TCheckbutton", background=p["bg"], foreground=p["text"])
-            style.map("TCheckbutton", background=[("active", p["bg"])])
-            style.configure("TRadiobutton", background=p["bg"], foreground=p["text"])
-            style.map("TRadiobutton", background=[("active", p["bg"])])
-            style.configure("TLabelframe", background=p["bg"], foreground=p["text"],
-                            bordercolor=p["border"])
-            style.configure("TLabelframe.Label", background=p["bg"],
-                            foreground=p["muted"])
-            style.configure("Sidebar.Treeview", background=p["surface"],
-                            fieldbackground=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], rowheight=24)
-            style.map("Sidebar.Treeview", background=[("selected", p["primary"])],
-                      foreground=[("selected", p["sel_fg"])])
-            style.configure("Layers.Treeview", background=p["surface"],
-                            fieldbackground=p["surface"], foreground=p["text"],
-                            rowheight=24)
-            style.map("Layers.Treeview", background=[("selected", p["primary"])],
-                      foreground=[("selected", p["sel_fg"])])
-            style.configure("TScale", background=p["bg"], troughcolor=p["trough"])
-            style.configure("Horizontal.TScale", background=p["bg"],
-                            troughcolor=p["trough"])
-            style.configure("TScrollbar", background=p["surface"],
-                            troughcolor=p["bg"], bordercolor=p["border"],
-                            arrowcolor=p["text"])
-            style.configure("TSeparator", background=p["border"])
-
-            for widget, role in list(self._tracked):
+            for widget, role in list(self._app_tracked):
                 try:
-                    if role == "listbox":
-                        widget.configure(bg=p["surface"], fg=p["text"],
-                                         selectbackground=p["primary"],
-                                         selectforeground=p["sel_fg"],
-                                         highlightthickness=1,
-                                         highlightbackground=p["border"], borderwidth=0)
-                    elif role in ("imgcanvas",):
+                    if not widget.winfo_exists():
+                        self._app_tracked.remove((widget, role))
+                        continue
+                    if role == "imgcanvas":
                         widget.configure(bg=p["canvas"], highlightthickness=0)
-                    elif role in ("curve",):
+                    elif role == "curve":
                         widget.configure(bg=p["surface"], highlightthickness=1,
                                          highlightbackground=p["border"])
                 except Exception:
                     pass
-            if getattr(self, "canvas", None):
+
+        def _extra_styles(self):
+            """Define the few ttk label styles the tool panels reference that
+            Aura's style_ttk does not (re-applied after every theme flip)."""
+            p = aura.P()
+            fam = aura._family()
+            cap = aura.TOKENS["type"]["caption"]
+            st = ttk.Style(self)
+            st.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"],
+                         font=(fam, cap))
+            st.configure("Status.TLabel", background=p["bg"],
+                         foreground=p["muted"])
+            st.configure("Brand.TLabel", background=p["bg"], foreground=p["text"],
+                         font=(fam, 13, "bold"))
+            st.configure("Header.TLabel", background=p["bg"],
+                         foreground=p["text"], font=(fam, 15, "bold"))
+
+        def set_theme(self, theme):
+            super().set_theme(theme)
+            self._extra_styles()
+            self._recolor_custom()
+            try:
                 self.canvas.redraw()
+            except Exception:
+                pass
+            for ce in list(self._curves):
+                try:
+                    ce.redraw()
+                except Exception:
+                    pass
 
         def toggle_theme(self):
-            self.theme = "dark" if self.theme == "light" else "light"
-            guiconfig.set_theme(self.theme)
-            self._apply_theme()
-            self._theme_btn.configure(
-                text="☀ Light" if self.theme == "dark" else "🌙 Dark")
+            self.set_theme("light" if self.theme == "dark" else "dark")
+
+        # ---- content: persistent canvas (left) + swappable tool panel (right)
+        def _build_content_area(self):
+            self._content.grid_columnconfigure(0, weight=1)
+            self._content.grid_columnconfigure(1, weight=0, minsize=346)
+            self._content.grid_rowconfigure(0, weight=1)
+
+            left = ctk.CTkFrame(self._content, fg_color="transparent")
+            left.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+            left.grid_rowconfigure(0, weight=1)
+            left.grid_columnconfigure(0, weight=1)
+            self.canvas = ImageCanvas(left, self)
+            self.canvas.grid(row=0, column=0, sticky="nsew")
+
+            zoom = ctk.CTkFrame(left, fg_color="transparent")
+            zoom.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+            aura.AuraButton(zoom, "−", kind="secondary", width=34, height=28,
+                            command=lambda: self.canvas.zoom(0.8)).pack(side="left")
+            aura.AuraButton(zoom, "Fit", kind="secondary", width=48, height=28,
+                            command=lambda: self.canvas.fit()).pack(
+                side="left", padx=5)
+            aura.AuraButton(zoom, "+", kind="secondary", width=34, height=28,
+                            command=lambda: self.canvas.zoom(1.25)).pack(side="left")
+            self.zoom_lbl = aura.Caption(zoom, "—")
+            self.zoom_lbl.pack(side="left", padx=12)
+            self.size_lbl = aura.Caption(zoom, "")
+            self.size_lbl.pack(side="right")
+            self.hist_lbl = aura.Caption(zoom, "")
+            self.hist_lbl.pack(side="right", padx=12)
+
+            self._panelhost = ctk.CTkFrame(self._content, fg_color="transparent",
+                                           width=346)
+            self._panelhost.grid(row=0, column=1, sticky="nsew")
+            self._panelhost.grid_propagate(False)
+            self._panelhost.grid_columnconfigure(0, weight=1)
+            self._panelhost.grid_rowconfigure(0, weight=1)
+
+            # header quick actions (right of the page title)
+            aura.AuraButton(self.header_actions, "Open", kind="secondary",
+                            height=30, command=self.open_image).pack(side="left")
+            aura.AuraButton(self.header_actions, "Save", kind="secondary",
+                            height=30, command=self.save_image).pack(
+                side="left", padx=(8, 0))
+            aura.AuraButton(self.header_actions, "Undo", kind="ghost", height=30,
+                            width=56, command=self.undo).pack(
+                side="left", padx=(8, 0))
+            aura.AuraButton(self.header_actions, "Redo", kind="ghost", height=30,
+                            width=56, command=self.redo).pack(side="left")
+
+        # ---- sidebar nav: one section per tool, grouped by category caption
+        def _build_nav(self):
+            # AuraApp's nav is a plain frame; 29 tools need a scrollable rail.
+            try:
+                self._nav.destroy()
+            except Exception:
+                pass
+            self.sidebar.grid_rowconfigure(1, weight=1)
+            self.sidebar.grid_rowconfigure(2, weight=0)
+            self._nav = ctk.CTkScrollableFrame(self.sidebar,
+                                               fg_color="transparent", width=196)
+            self._nav.grid(row=1, column=0, sticky="nsew", padx=4)
+            for cat, tools in TOOL_TREE:
+                self._add_nav_header(cat)
+                for tid, label in tools:
+                    self.add_section(tid, label, GLYPHS.get(tid, "◈"),
+                                     self._make_builder(tid))
+
+        def _add_nav_header(self, text):
+            aura.SectionLabel(self._nav, text).pack(
+                fill="x", padx=8, pady=(12, 3), anchor="w")
+
+        def add_section(self, sid, label, glyph="", builder=None):
+            """Register a sidebar tool pill + a lazily-built scrollable panel."""
+            item = aura._NavItem(self._nav, label, glyph,
+                                 lambda s=sid: self.show(s))
+            item.pack(fill="x", pady=1)
+            holder = ctk.CTkScrollableFrame(self._panelhost,
+                                            fg_color="transparent")
+            holder.grid(row=0, column=0, sticky="nsew")
+            holder.grid_remove()
+            self._sections[sid] = {"item": item, "frame": holder,
+                                   "builder": builder, "label": label,
+                                   "built": False}
+            self._panels[sid] = holder
+            self._order.append(sid)
+            return holder
+
+        def _make_builder(self, tid):
+            def build(parent):
+                desc = TOOL_DESCRIPTIONS.get(tid, "")
+                if desc:
+                    ttk.Label(parent, text=desc, style="Sub.TLabel",
+                              wraplength=306, justify="left").pack(
+                        anchor="w", pady=(0, 10))
+                getattr(self, "_panel_" + tid)(parent)
+            return build
+
+        def show(self, sid):
+            """Switch tool panels (the canvas persists) and update the header."""
+            try:
+                self.canvas.disarm()
+                self.canvas.clear_preview()
+            except Exception:
+                pass
+            super().show(sid)
+            self._current = self._sections.get(sid, {}).get("frame")
+            self._clear_result()
+
+        # Crawler-friendly navigation aliases.
+        def _show_section(self, sid):
+            self.show(sid)
+
+        def _select_tool(self, tool_id):
+            self.show(tool_id)
 
         # ---- menu ------------------------------------------------------
         def _build_menu(self):
@@ -1010,135 +1104,6 @@ def build_app():
         def _clear_recent(self):
             guiconfig.clear_recent()
             self._fill_recent_menu()
-
-        # ---- layout ----------------------------------------------------
-        def _build_layout(self):
-            # top brand + quick toolbar
-            top = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 7))
-            top.pack(fill="x", side="top")
-            ttk.Label(top, text="Image Toolkit", style="Brand.TLabel").pack(side="left")
-            ttk.Label(top, style="Status.TLabel",
-                      text="  offline · open source · by QuickOpen").pack(side="left")
-            self._theme_btn = ttk.Button(
-                top, style="Toggle.TButton", command=self.toggle_theme,
-                text="☀ Light" if self.theme == "dark" else "🌙 Dark")
-            self._theme_btn.pack(side="right")
-            ttk.Button(top, text="Redo ↷", style="Toggle.TButton",
-                       command=self.redo).pack(side="right", padx=2)
-            ttk.Button(top, text="Undo ↶", style="Toggle.TButton",
-                       command=self.undo).pack(side="right", padx=2)
-            ttk.Button(top, text="Save", style="Toggle.TButton",
-                       command=self.save_image).pack(side="right", padx=2)
-            ttk.Button(top, text="Open", style="Toggle.TButton",
-                       command=self.open_image).pack(side="right", padx=2)
-
-            body = ttk.Frame(self, style="TFrame")
-            body.pack(fill="both", expand=True)
-
-            # sidebar (tool tree)
-            side = ttk.Frame(body, style="Sidebar.TFrame", width=210)
-            side.pack(side="left", fill="y")
-            side.pack_propagate(False)
-            self.nav = ttk.Treeview(side, show="tree", selectmode="browse",
-                                    style="Sidebar.Treeview")
-            self.nav.pack(fill="both", expand=True, padx=6, pady=6)
-            for cat, tools in TOOL_TREE:
-                cid = self.nav.insert("", "end", text=cat, open=True, tags=("cat",))
-                for tid, label in tools:
-                    iid = self.nav.insert(cid, "end", text="   " + label)
-                    self._nav_ids[iid] = tid
-            self.nav.tag_configure("cat", font=(FONT, 10, "bold"))
-            self.nav.bind("<<TreeviewSelect>>", self._on_nav_select)
-
-            # centre: canvas + zoom bar
-            centre = ttk.Frame(body, style="TFrame")
-            centre.pack(side="left", fill="both", expand=True)
-            self.canvas = ImageCanvas(centre, self)
-            self.canvas.pack(fill="both", expand=True, padx=2, pady=2)
-            zoombar = ttk.Frame(centre, style="Sidebar.TFrame", padding=(8, 4))
-            zoombar.pack(fill="x", side="bottom")
-            ttk.Button(zoombar, text="−", width=3,
-                       command=lambda: self.canvas.zoom(0.8)).pack(side="left")
-            ttk.Button(zoombar, text="Fit", width=4,
-                       command=lambda: self.canvas.fit()).pack(side="left", padx=3)
-            ttk.Button(zoombar, text="+", width=3,
-                       command=lambda: self.canvas.zoom(1.25)).pack(side="left")
-            self.zoom_lbl = ttk.Label(zoombar, text="—", style="Status.TLabel")
-            self.zoom_lbl.pack(side="left", padx=10)
-            self.size_lbl = ttk.Label(zoombar, text="", style="Status.TLabel")
-            self.size_lbl.pack(side="right")
-
-            # right: tool controls
-            right = ttk.Frame(body, style="Sidebar.TFrame", width=340)
-            right.pack(side="right", fill="y")
-            right.pack_propagate(False)
-            head = ttk.Frame(right, style="Sidebar.TFrame", padding=(14, 12, 14, 4))
-            head.pack(fill="x")
-            self.title_lbl = ttk.Label(head, text="Welcome", style="Brand.TLabel")
-            self.title_lbl.pack(anchor="w")
-            self.desc_lbl = ttk.Label(head, text="", style="Status.TLabel",
-                                      wraplength=300, justify="left")
-            self.desc_lbl.pack(anchor="w", pady=(2, 4))
-            self.container = ttk.Frame(right, style="TFrame", padding=(14, 6))
-            self.container.pack(fill="both", expand=True)
-
-            # bottom status/results bar
-            bar = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 6))
-            bar.pack(fill="x", side="bottom")
-            self.status_lbl = ttk.Label(bar, text="Ready", style="Status.TLabel",
-                                        width=14, anchor="w")
-            self.status_lbl.pack(side="left")
-            self.hist_lbl = ttk.Label(bar, text="", style="Status.TLabel")
-            self.hist_lbl.pack(side="right")
-            self.result_lbl = ttk.Label(bar, text="", style="Status.TLabel",
-                                        anchor="w", wraplength=760, justify="left")
-            self.result_lbl.pack(side="left", fill="x", expand=True, padx=8)
-
-        # ---- tool navigation ------------------------------------------
-        def _select_first_tool(self):
-            for iid in self._nav_ids:
-                self.nav.selection_set(iid)
-                self.nav.see(iid)
-                break
-
-        def _select_tool(self, tool_id):
-            for iid, tid in self._nav_ids.items():
-                if tid == tool_id:
-                    self.nav.selection_set(iid)
-                    self.nav.see(iid)
-                    return
-
-        def _on_nav_select(self, _e=None):
-            sel = self.nav.selection()
-            if not sel:
-                return
-            tid = self._nav_ids.get(sel[0])
-            if tid:
-                self._show_tool(tid)
-
-        def _show_tool(self, tool_id):
-            self.canvas.disarm()
-            self.canvas.clear_preview()
-            if self._current is not None:
-                self._current.pack_forget()
-            panel = self._panels.get(tool_id)
-            if panel is None:
-                panel = ttk.Frame(self.container, style="TFrame")
-                builder = getattr(self, "_panel_" + tool_id, None)
-                if builder:
-                    builder(panel)
-                else:
-                    ttk.Label(panel, text="Not implemented.").pack()
-                self._panels[tool_id] = panel
-                self._apply_theme()
-            panel.pack(fill="both", expand=True)
-            self._current = panel
-            for _cat, tools in TOOL_TREE:
-                for tid, label in tools:
-                    if tid == tool_id:
-                        self.title_lbl.configure(text=label)
-            self.desc_lbl.configure(text=TOOL_DESCRIPTIONS.get(tool_id, ""))
-            self._clear_result()
 
         # ---- background op runner -------------------------------------
         def _bg(self, work, on_ok, button=None, busy="Working…", require_image=True):
@@ -1354,19 +1319,19 @@ def build_app():
                      lambda res: (self.canvas.clear_preview(),
                                   self.commit(res, message)), button=button)
 
-        # ---- result / status bar --------------------------------------
+        # ---- result / status bar (routed to the Aura inline status bar) ----
         def _set_status(self, text, kind="idle"):
-            p = self._pal()
-            color_ = {"working": p["primary"], "ok": p["ok"], "err": p["err"]}.get(
-                kind, p["muted"])
-            self.status_lbl.configure(text=text, foreground=color_)
+            # Aura StatusBar understands kinds idle/working/ok/err directly.
+            self.statusbar.set_status(text, kind)
 
         def _clear_result(self):
-            self.result_lbl.configure(text="")
-            self._set_status("Ready")
+            if self.image is None:
+                self.statusbar.set_status("Open an image to begin  (File ▸ Open)")
+            else:
+                self.statusbar.set_status("Ready")
 
         def _show_error(self, message):
-            self.result_lbl.configure(text="✕ " + message, foreground=self._pal()["err"])
+            self.statusbar.set_error(message)
 
         def report_success(self, message, outputs=None):
             for o in (outputs or []):
@@ -1374,8 +1339,7 @@ def build_app():
                     guiconfig.add_recent(o)
             if outputs:
                 self._fill_recent_menu()
-            self.result_lbl.configure(text="✓ " + message, foreground=self._pal()["ok"])
-            self._set_status("done", kind="ok")
+            self.statusbar.set_success(message)
 
         # ---- About -----------------------------------------------------
         def _about(self):
@@ -1410,7 +1374,9 @@ def build_app():
 
         # ---- small panel helpers --------------------------------------
         def _apply_btn(self, parent, text="Apply"):
-            b = ttk.Button(parent, text=text, style="Accent.TButton")
+            # Aura primary button (ttk-compatible .state([...]) shim keeps the
+            # _bg(..., button=btn) disable/enable dance working).
+            b = aura.AuraButton(parent, text, kind="primary")
             b.pack(fill="x", pady=(12, 4))
             return b
 
@@ -2043,7 +2009,7 @@ def build_app():
                       text="Non-destructive compositing. The working image is the "
                            "base layer; add more and blend.").pack(anchor="w", pady=2)
             tree = ttk.Treeview(parent, columns=("info",), show="tree",
-                                style="Layers.Treeview", height=6, selectmode="browse")
+                                height=6, selectmode="browse")
             tree.pack(fill="x", pady=6)
 
             state = {"doc": None}
@@ -2336,6 +2302,10 @@ def main():
     try:
         App = build_app()
         app = App()
+    except ImportError as exc:
+        print(f"{APP_NAME}: the GUI needs the 'customtkinter' package "
+              f"({exc}). Install it with:  pip install customtkinter")
+        return 0
     except tk.TclError as exc:
         print(f"{APP_NAME}: no graphical display available — cannot start the "
               f"GUI here ({exc}). This app is intended for the Windows desktop.")

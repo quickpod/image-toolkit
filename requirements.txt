@@ -5,3 +5,6 @@ opencv-python>=4.8         # Apache-2.0 (cv2); MIT packaging
 scikit-image>=0.22         # BSD
 rawpy>=0.19                # LibRaw (LGPL/CDDL) — RAW loading; import is guarded
 piexif>=1.1                # MIT — EXIF read/write/strip
+# Aura design system (vendored imgtoolkit/aura.py) — CustomTkinter theme layer.
+customtkinter>=5.2         # MIT — antialiased rounded widgets + dark/light
+darkdetect>=0.8            # BSD — OS theme detection (pulled by customtkinter)

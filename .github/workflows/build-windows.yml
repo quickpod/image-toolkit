@@ -25,11 +25,13 @@ jobs:
           pyinstaller --onefile --windowed --name ImageToolkit
           --icon image-toolkit.ico
           --version-file packaging/version.txt
+          --hidden-import imgtoolkit.__main__
           --add-data "image-toolkit.ico;."
           --collect-all cv2
           --collect-all skimage
           --collect-all rawpy
           --collect-all PIL
+          --collect-all customtkinter
           --collect-submodules numpy
           --collect-submodules piexif
           image_toolkit_app.py
@@ -51,4 +53,10 @@ jobs:
           path: |
             dist/ImageToolkit.exe
             packaging/dist/ImageToolkit-Setup.exe
+          if-no-files-found: error
+      - name: Upload staging (for signed repack)
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-toolkit-staging
+          path: packaging/staging
           if-no-files-found: error
