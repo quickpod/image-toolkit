@@ -26,7 +26,7 @@ from .io_util import load, save
 from .layers import (AdjustmentLayer, BLEND_MODES, Document, ImageLayer,
                      Layer, blend)
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 __all__ = [
     "__version__",

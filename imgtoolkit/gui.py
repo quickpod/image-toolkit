@@ -237,6 +237,7 @@ def build_app():
     """
     import tkinter as tk
     from tkinter import ttk, filedialog, colorchooser
+    from .aura import filedialog  # noqa: F811 - Aura kdialog-native pickers
     import customtkinter as ctk
     import numpy as np
     from PIL import Image, ImageTk
